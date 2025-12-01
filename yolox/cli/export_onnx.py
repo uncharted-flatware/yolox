@@ -1,6 +1,7 @@
 # Copyright (c) Megvii, Inc. and its affiliates.
 
 import argparse
+import inspect
 import logging
 from pathlib import Path
 from typing import cast
@@ -19,6 +20,7 @@ from onnxsim import simplify
 from onnxruntime.transformers.float16 import convert_float_to_float16
 
 logger = logging.getLogger(__name__)
+MIN_DYNAMO_OPSET = 18
 
 
 def make_parser():
@@ -57,6 +59,11 @@ def make_parser():
         action="store_true",
         help="keep input/output tensors as FP32 when using --half (applies keep_io_types flag)",
     )
+    parser.add_argument(
+        "--disable-dynamo",
+        action="store_true",
+        help="force the legacy torch.onnx exporter (required for opset < 18)",
+    )
 
     return parser
 
@@ -71,34 +78,49 @@ def main():
 
     # Always export to FP32 first
     dummy_input = torch.randn(args.batch_size, 3, 640, 640)
+    export_args = (dummy_input,)
+
+    supports_dynamo = "dynamo" in inspect.signature(torch.onnx.export).parameters
+    disable_dynamo = args.opset < MIN_DYNAMO_OPSET or args.disable_dynamo
+
+    if args.opset < MIN_DYNAMO_OPSET:
+        logger.info(
+            "Disabling dynamo exporter because requested opset %s < %s",
+            args.opset,
+            MIN_DYNAMO_OPSET,
+        )
+    if args.disable_dynamo:
+        logger.info("Dynamo exporter explicitly disabled via --disable-dynamo")
+
+    export_kwargs = {}
+    if supports_dynamo:
+        export_kwargs["dynamo"] = not disable_dynamo
+        logger.info(
+            "Using %s torch.onnx exporter",
+            "dynamo" if export_kwargs["dynamo"] else "legacy",
+        )
+    elif not disable_dynamo:
+        logger.info(
+            "Current PyTorch does not expose the dynamo flag; using legacy exporter"
+        )
+
+    dynamic_axes = (
+        {args.input: {0: "batch"}, args.output: {0: "batch"}} if args.dynamic else None
+    )
 
     torch.onnx.export(
         model.module,
-        dummy_input,
+        export_args,
         args.onnx_name,
         input_names=[args.input],
         output_names=[args.output],
-        dynamic_axes=(
-            {args.input: {0: "batch"}, args.output: {0: "batch"}}
-            if args.dynamic
-            else None
-        ),
+        dynamic_axes=dynamic_axes,
         opset_version=args.opset,
+        **export_kwargs,
     )
     logger.info(f"ONNX model has been successfully created: {args.onnx_name}")
 
-    # Convert to FP16 if requested using ONNX float16 conversion
-    if args.half:
-        logger.info("Converting ONNX model to FP16")
-        onnx_model = onnx.load(args.onnx_name)
-        onnx_model_fp16 = convert_float_to_float16(
-            onnx_model,
-            keep_io_types=args.keep_io,
-        )
-        onnx.save(onnx_model_fp16, args.onnx_name)
-        logger.info(f"FP16 ONNX model has been successfully created: {args.onnx_name}")
-
-    # Simplify as final step
+    # Simplify before any optional dtype conversions so downstream tools operate on a clean graph
     if args.onnxsim:
         logger.info("Simplify ONNX model")
         onnx_model = onnx.load(args.onnx_name)
@@ -110,6 +132,17 @@ def main():
         logger.info(
             f"Simplified ONNX model has been successfully created: {args.onnx_name}"
         )
+
+    # Convert to FP16 if requested using ONNX float16 conversion
+    if args.half:
+        logger.info("Converting ONNX model to FP16")
+        onnx_model = onnx.load(args.onnx_name)
+        onnx_model_fp16 = convert_float_to_float16(
+            onnx_model,
+            keep_io_types=args.keep_io,
+        )
+        onnx.save(onnx_model_fp16, args.onnx_name)
+        logger.info(f"FP16 ONNX model has been successfully created: {args.onnx_name}")
 
 
 if __name__ == "__main__":
